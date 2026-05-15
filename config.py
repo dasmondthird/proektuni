@@ -1,5 +1,4 @@
-# config.py — Конфигурация API YandexGPT и путей проекта
-
+# config.py — Конфигурация API YandexGPT и путей к базам данных
 import os
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -43,3 +42,13 @@ TEMPERATURE = 0.1
 MAX_TOKENS = 1024
 
 DB_PATH = os.path.join(BASE_DIR, "db", "customs.db")
+
+CUSTOMS_DATA_DIR = os.environ.get(
+    "CUSTOMS_DATA_DIR",
+    os.path.join(os.path.expanduser("~"), "Desktop", "apsps", "CustomsData"),
+)
+CUSTOMS_REF_DB = os.path.join(CUSTOMS_DATA_DIR, "CustomsReference.DB")
+USER_DATA_DB = os.path.join(CUSTOMS_DATA_DIR, "UserData.DB")
+
+REF_DB_AVAILABLE = os.path.exists(CUSTOMS_REF_DB)
+USER_DB_AVAILABLE = os.path.exists(USER_DATA_DB)

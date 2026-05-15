@@ -11,12 +11,11 @@ from typing import Dict, List
 
 from verifier import (
     get_duty_info, get_preference_coefficient, get_preference_info,
-    get_customs_fee, get_customs_fee_range,
+    get_customs_fee, get_customs_fee_range, get_currency_rate,
 )
 
 
 class UnverifiedCodeError(Exception):
-    """Код ТН ВЭД не найден в справочнике — расчёт недопустим без подтверждения."""
     pass
 
 
@@ -28,6 +27,27 @@ def _rule(rule_id: str, name: str, explanation: str) -> Dict:
     return {"id": rule_id, "name": name, "explanation": explanation}
 
 
+def _calc_rate_amount(
+    rate_value: float,
+    rate_sign: str,
+    customs_value: float,
+    base_quantity: float,
+    eur_rate: float,
+    usd_rate: float,
+) -> float:
+    if rate_value is None or rate_value == 0:
+        return 0.0
+    if rate_sign == "%":
+        return customs_value * rate_value / 100.0
+    elif rate_sign == "978":
+        return rate_value * base_quantity * eur_rate
+    elif rate_sign == "840":
+        return rate_value * base_quantity * usd_rate
+    elif rate_sign == "643":
+        return rate_value * base_quantity
+    return customs_value * rate_value / 100.0
+
+
 def calculate_all_payments(
     invoice_price: float,
     delivery_cost: float,
@@ -37,25 +57,19 @@ def calculate_all_payments(
     country_code: str,
     weight: float = 0.0,
     eur_rate: float = 1.0,
+    usd_rate: float = 1.0,
     allow_unverified: bool = False,
     manual_duty_rate: float = 0.0,
     manual_vat_rate: float = 0.0,
 ) -> Dict:
-    """
-    Полный расчёт всех таможенных платежей.
-
-    Возвращает словарь с суммами и перечнем applied_rules — списком словарей
-    {"id": "R5", "name": "Адвалорная пошлина", "explanation": "..."},
-    привязанных к 18 продукционным правилам экспертной подсистемы.
-    """
     rules: List[Dict] = []
 
-    # ── Предварительный этап: таможенная стоимость (метод 1 — по стоимости сделки) ──
+    # ── Таможенная стоимость (метод 1 — по стоимости сделки) ──
     customs_value = (invoice_price + delivery_cost + insurance_cost) * exchange_rate
     customs_value = round(customs_value, 2)
     cv_explanation = (
         f"ТС = ({_fmt(invoice_price)} + {_fmt(delivery_cost)} + {_fmt(insurance_cost)}) "
-        f"× {exchange_rate:.2f} = {_fmt(customs_value)} ₽"
+        f"× {exchange_rate:.4f} = {_fmt(customs_value)} ₽"
     )
 
     # ── Получение ставок из базы знаний ──
@@ -71,6 +85,14 @@ def calculate_all_payments(
         duty_info = {
             "duty_type": "адвалорная",
             "duty_rate": manual_duty_rate,
+            "rate_sign": "%",
+            "rate_unit": None,
+            "add_rate": None,
+            "add_rate_sign": None,
+            "add_rate_unit": None,
+            "alt_rate": None,
+            "alt_rate_sign": None,
+            "alt_rate_unit": None,
             "vat_rate": manual_vat_rate,
             "excise": 0,
             "source": "Ручная верификация пользователем (код вне справочника)",
@@ -82,23 +104,29 @@ def calculate_all_payments(
     vat_rate = duty_info["vat_rate"]
     excise = duty_info["excise"]
 
-    # ══════════════════════════════════════════════════════════════
+    rate_sign = duty_info.get("rate_sign", "%")
+    add_rate = duty_info.get("add_rate")
+    add_rate_sign = duty_info.get("add_rate_sign")
+    alt_rate = duty_info.get("alt_rate")
+    alt_rate_sign = duty_info.get("alt_rate_sign")
+
+    # ═══════════════════════════════════════════════════════════
     # БЛОК 1: Преференциальный режим (R1–R4)
-    # ══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     pref_info = get_preference_info(country_code)
     coefficient = pref_info["coefficient"] if pref_info else 1.0
 
     if pref_info and coefficient == 0.0:
         rules.append(_rule(
-            "R1", "Нулевая ставка (ЕАЭС)",
-            f"Страна {pref_info['country_name']} ({country_code}) входит в ЕАЭС → "
+            "R1", "Нулевая ставка (ЕАЭС / наименее развитая)",
+            f"Страна {pref_info['country_name']} ({country_code}) — {pref_info['preference_type']} → "
             f"коэффициент = 0 (пошлина не взимается)"
         ))
     elif pref_info and coefficient < 1.0:
         rules.append(_rule(
             "R2", "Преференциальный режим",
-            f"Страна {pref_info['country_name']} ({country_code}) имеет преференциальное "
-            f"соглашение → коэффициент = {coefficient}"
+            f"Страна {pref_info['country_name']} ({country_code}) — {pref_info['preference_type']} → "
+            f"коэффициент = {coefficient}"
         ))
     elif pref_info and coefficient == 1.0:
         rules.append(_rule(
@@ -113,37 +141,75 @@ def calculate_all_payments(
             f"коэффициент = 1,0 (полная ставка по умолчанию)"
         ))
 
-    # ══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     # БЛОК 2: Расчёт ввозной таможенной пошлины (R5–R7)
-    # ══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
+    base_quantity = weight if weight > 0 else 1.0
+
     if duty_type == "адвалорная":
         duty_amount = customs_value * duty_rate * coefficient / 100
         rules.append(_rule(
             "R5", "Адвалорная пошлина",
             f"Пошлина = ТС × ставка × коэфф / 100 = "
-            f"{_fmt(customs_value)} × {duty_rate} × {coefficient} / 100 = {_fmt(duty_amount)} ₽"
+            f"{_fmt(customs_value)} × {duty_rate}% × {coefficient} / 100 = {_fmt(duty_amount)} ₽"
         ))
+
     elif duty_type == "специфическая":
-        duty_amount = weight * duty_rate * eur_rate
+        currency_mul = eur_rate if rate_sign == "978" else (usd_rate if rate_sign == "840" else 1.0)
+        duty_amount = duty_rate * base_quantity * currency_mul
+        currency_name = {"978": "EUR", "840": "USD", "643": "RUB"}.get(rate_sign, "")
         rules.append(_rule(
             "R6", "Специфическая пошлина",
-            f"Пошлина = вес × ставка × курс EUR = "
-            f"{weight} × {duty_rate} × {eur_rate:.2f} = {_fmt(duty_amount)} ₽"
+            f"Пошлина = ставка × кол-во × курс = "
+            f"{duty_rate} {currency_name} × {base_quantity} × {currency_mul:.4f} = {_fmt(duty_amount)} ₽"
         ))
-    else:
+
+    elif duty_type == "комбинированная":
         ad_valorem = customs_value * duty_rate * coefficient / 100
-        specific = weight * duty_rate * eur_rate
-        duty_amount = max(ad_valorem, specific)
+
+        add_amount = 0.0
+        if add_rate is not None and add_rate > 0:
+            add_amount = _calc_rate_amount(
+                add_rate, add_rate_sign or rate_sign,
+                customs_value, base_quantity, eur_rate, usd_rate,
+            )
+
+        main_sum = ad_valorem + add_amount
+
+        alt_amount = 0.0
+        if alt_rate is not None and alt_rate > 0:
+            alt_amount = _calc_rate_amount(
+                alt_rate, alt_rate_sign or rate_sign,
+                customs_value, base_quantity, eur_rate, usd_rate,
+            )
+
+        if alt_amount > 0 and alt_amount > main_sum:
+            duty_amount = alt_amount
+            rules.append(_rule(
+                "R7", "Комбинированная пошлина (альтернативная ставка)",
+                f"max(основная {_fmt(main_sum)}, альтернативная {_fmt(alt_amount)}) "
+                f"= {_fmt(duty_amount)} ₽ (применена альтернативная «но не менее»)"
+            ))
+        else:
+            duty_amount = main_sum
+            rules.append(_rule(
+                "R7", "Комбинированная пошлина (основная ставка)",
+                f"max(основная {_fmt(main_sum)}, альтернативная {_fmt(alt_amount)}) "
+                f"= {_fmt(duty_amount)} ₽ (применена основная)"
+            ))
+    else:
+        duty_amount = customs_value * duty_rate * coefficient / 100
         rules.append(_rule(
-            "R7", "Комбинированная пошлина",
-            f"Пошлина = max(адвалорная {_fmt(ad_valorem)}, специфическая {_fmt(specific)}) "
-            f"= {_fmt(duty_amount)} ₽"
+            "R5", "Пошлина",
+            f"Пошлина = ТС × ставка × коэфф / 100 = "
+            f"{_fmt(customs_value)} × {duty_rate}% × {coefficient} / 100 = {_fmt(duty_amount)} ₽"
         ))
+
     duty_amount = round(duty_amount, 2)
 
-    # ══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     # БЛОК 3: Налоговая база НДС (R8–R9)
-    # ══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     vat_base = customs_value + duty_amount + excise
     if excise > 0:
         rules.append(_rule(
@@ -158,9 +224,9 @@ def calculate_all_payments(
             f"{_fmt(customs_value)} + {_fmt(duty_amount)} = {_fmt(vat_base)} ₽"
         ))
 
-    # ══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     # БЛОК 4: Расчёт НДС (R10)
-    # ══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     vat_amount = round(vat_base * vat_rate / 100, 2)
     rules.append(_rule(
         "R10", "Расчёт НДС",
@@ -168,9 +234,9 @@ def calculate_all_payments(
         f"{_fmt(vat_base)} × {vat_rate} / 100 = {_fmt(vat_amount)} ₽"
     ))
 
-    # ══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     # БЛОК 5: Таможенный сбор по диапазону ТС (R11–R18)
-    # ══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
     customs_fee = get_customs_fee(customs_value)
     fee_range = get_customs_fee_range(customs_value)
 
@@ -211,6 +277,7 @@ def calculate_all_payments(
         "cv_explanation": cv_explanation,
         "duty_type": duty_type,
         "duty_rate": duty_rate,
+        "rate_sign": rate_sign,
         "duty_coefficient": coefficient,
         "duty_amount": duty_amount,
         "duty_source": source,

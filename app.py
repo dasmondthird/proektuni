@@ -13,12 +13,13 @@ from verifier import (
     verify_code, get_duty_info, get_all_countries,
     get_customs_fee, get_preference_coefficient,
     score_code_match, find_codes_by_description,
-    get_knowledge_base_stats,
+    get_knowledge_base_stats, get_latest_rates,
+    get_currency_rate, update_currency_rates_from_cbr,
 )
 from calculator import calculate_all_payments, UnverifiedCodeError
 from conclusion import generate_conclusion, generate_short_conclusion
 from evaluation import calculate_metrics
-from config import DB_PATH, BASE_DIR, YANDEX_API_KEY
+from config import DB_PATH, BASE_DIR, YANDEX_API_KEY, REF_DB_AVAILABLE, USER_DB_AVAILABLE
 
 
 # ──────────────────────────────────────────────────────────────
@@ -47,10 +48,17 @@ def ensure_database():
             init_database()
             st.rerun()
         except Exception as e:
-            st.error(f"❌ Ошибка инициализации БД: {e}")
+            st.error(f"❌ Ошибка инициализации локальной БД: {e}")
             st.stop()
 
 ensure_database()
+
+if not REF_DB_AVAILABLE:
+    st.warning(
+        "⚠️ Профессиональный справочник CustomsReference.DB не найден. "
+        "Система работает с ограниченной базой данных. "
+        "Скачайте справочник и укажите путь в переменной CUSTOMS_DATA_DIR."
+    )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -59,12 +67,35 @@ ensure_database()
 with st.sidebar:
     st.header("📊 База знаний")
     kb = get_knowledge_base_stats()
+    src_label = "CustomsReference.DB" if REF_DB_AVAILABLE else "локальная (ограниченная)"
+    st.caption(f"Источник: {src_label}")
     st.markdown(
-        f"- ✅ Коды ТН ВЭД: **{kb['hs_codes']}** записей\n"
-        f"- ✅ Страны / преференции: **{kb['preferences']}** записей\n"
-        f"- ✅ Диапазоны таможенных сборов: **{kb['customs_fees']}** записей\n"
+        f"- ✅ Коды ТН ВЭД: **{kb['hs_codes']:,}** записей\n"
+        f"- ✅ Ставки пошлин: **{kb['entrance_duty']:,}** записей\n"
+        f"- ✅ Ставки НДС: **{kb['vat_records']:,}** записей\n"
+        f"- ✅ Акцизы: **{kb['excise_records']:,}** записей\n"
+        f"- ✅ Страны: **{kb['countries']}**\n"
+        f"- ✅ Курсы валют: **{kb['currency_rates']:,}** записей\n"
+        f"- ✅ Сертификаты: **{kb['certificates']:,}** записей\n"
+        f"- ✅ Таможенные сборы: **{kb['customs_fees']}** диапазонов\n"
         f"- ✅ Продукционные правила: **{kb['rules']}**"
     )
+
+    if USER_DB_AVAILABLE:
+        st.markdown("---")
+        st.header("💱 Курсы валют ЦБ РФ")
+        for code in ("USD", "EUR", "CNY"):
+            ri = get_currency_rate(code)
+            if ri:
+                st.caption(f"{code}: **{ri['rate']:.4f}** ₽ ({ri['date']})")
+        if st.button("🔄 Обновить курсы", key="update_rates"):
+            ok = update_currency_rates_from_cbr()
+            if ok:
+                st.success("✅ Курсы обновлены")
+                st.session_state.currency_rates_loaded = False
+                st.rerun()
+            else:
+                st.info("Нет новых данных или ошибка подключения к ЦБ РФ")
 
     st.markdown("---")
     st.header("🧪 Метрики тестирования")
@@ -144,6 +175,28 @@ def fmt(v: float) -> str:
     return f"{v:,.2f}".replace(",", " ").replace(".", ",")
 
 
+def _format_duty_rate(info: dict) -> str:
+    """Форматирование ставки пошлины с учётом типа (адвалорная/специфическая)."""
+    rate = info.get("duty_rate", 0)
+    dtype = info.get("duty_type", "адвалорная")
+    # Для verify_code результата нет rate_sign, нужно определить по duty_type
+    if dtype == "специфическая":
+        # Получаем из get_duty_info для точного rate_sign
+        di = get_duty_info(info.get("code", ""))
+        if di:
+            sign = di.get("rate_sign", "%")
+            if sign == "978":
+                return f"{rate} EUR/ед. ({dtype})"
+            elif sign == "840":
+                return f"{rate} USD/ед. ({dtype})"
+            elif sign == "643":
+                return f"{rate} ₽/ед. ({dtype})"
+        return f"{rate} ед. ({dtype})"
+    elif dtype == "комбинированная":
+        return f"{rate}% + спец. ({dtype})"
+    return f"{rate}% ({dtype})"
+
+
 # ──────────────────────────────────────────────────────────────
 # Вспомогательная функция: объединить LLM-коды и коды из БД
 # ──────────────────────────────────────────────────────────────
@@ -196,7 +249,12 @@ for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
-CURRENCY_RATES = {"USD": 92.50, "EUR": 100.00, "CNY": 12.50}
+_DEFAULT_RATES = {"USD": 92.50, "EUR": 100.00, "CNY": 12.50}
+if "currency_rates_loaded" not in st.session_state:
+    live = get_latest_rates()
+    st.session_state.currency_rates_loaded = True
+    st.session_state.live_rates = live if live else {}
+CURRENCY_RATES = {**_DEFAULT_RATES, **st.session_state.get("live_rates", {})}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -284,9 +342,15 @@ with col_insurance:
 
 col_rate, col_date = st.columns(2)
 with col_rate:
+    default_rate = CURRENCY_RATES.get(currency, 1.0)
+    rate_hint = ""
+    rate_info = get_currency_rate(currency) if USER_DB_AVAILABLE else None
+    if rate_info:
+        rate_hint = f" (ЦБ РФ на {rate_info['date']})"
+        default_rate = round(rate_info["rate"], 4)
     exchange_rate = st.number_input(
-        f"Курс ЦБ РФ (₽ за 1 {currency})", min_value=0.01,
-        value=CURRENCY_RATES[currency], format="%.2f", key=f"rate_{currency}",
+        f"Курс ЦБ РФ (₽ за 1 {currency}){rate_hint}", min_value=0.01,
+        value=default_rate, format="%.4f", key=f"rate_{currency}",
     )
 with col_date:
     declaration_date = st.date_input("Дата декларирования", key="decl_date")
@@ -399,9 +463,19 @@ if show_classification:
                     st.write(verified["description"])
                     duty_info = get_duty_info(code)
                     if duty_info:
+                        _sign = duty_info.get("rate_sign", "%")
+                        if _sign == "%":
+                            _rate_str = f"{duty_info['duty_rate']}%"
+                        elif _sign == "978":
+                            _rate_str = f"{duty_info['duty_rate']} EUR/ед."
+                        elif _sign == "840":
+                            _rate_str = f"{duty_info['duty_rate']} USD/ед."
+                        else:
+                            _rate_str = f"{duty_info['duty_rate']} ₽/ед."
+                        _excise_str = f", акциз: {duty_info['excise']} ₽" if duty_info.get("excise") else ""
                         st.caption(
-                            f"Пошлина: {duty_info['duty_rate']}% ({duty_info['duty_type']}), "
-                            f"НДС: {duty_info['vat_rate']}%"
+                            f"Пошлина: {_rate_str} ({duty_info['duty_type']}), "
+                            f"НДС: {duty_info['vat_rate']}%{_excise_str}"
                         )
                     if score_info["score"] > 0:
                         st.info(f"📊 {score_info['explanation']}")
@@ -471,6 +545,7 @@ if show_classification:
                         "Описание",
                         "Ставка пошлины",
                         "Ставка НДС",
+                        "Акциз",
                         "Источник ставки",
                         "Дата обновления записи",
                         "Скоринг признаков",
@@ -481,9 +556,10 @@ if show_classification:
                         "найден в локальной базе знаний",
                         str(chosen_verified.get("group_number", "")),
                         chosen_verified["description"],
-                        f"{chosen_verified['duty_rate']}% ({chosen_verified['duty_type']})",
+                        _format_duty_rate(chosen_verified),
                         f"{chosen_verified['vat_rate']}%",
-                        "локальная база знаний (hs_codes)",
+                        f"{chosen_verified.get('excise', 0)} ₽" if chosen_verified.get('excise') else "нет",
+                        "CustomsReference.DB" if REF_DB_AVAILABLE else "локальная база знаний",
                         chosen_verified.get("updated_at", "—"),
                         f"{sc['score']} баллов из {sc['max_score']}",
                         "; ".join(matched_keywords) if matched_keywords else "нет совпадений",
@@ -515,15 +591,21 @@ if show_classification:
                     value=22.0, format="%.1f", key="manual_vat",
                 )
 
-    eur_rate = CURRENCY_RATES["EUR"]
+    eur_rate = CURRENCY_RATES.get("EUR", 100.0)
+    usd_rate = CURRENCY_RATES.get("USD", 92.5)
     weight_input = 0.0
     if chosen_verified and chosen_verified.get("duty_type") in ("специфическая", "комбинированная"):
-        st.info("ℹ️ Специфическая/комбинированная ставка: укажите курс ЕВРО и вес.")
-        c1, c2 = st.columns(2)
+        st.info("ℹ️ Специфическая/комбинированная ставка: укажите курсы валют и вес/количество.")
+        c1, c2, c3 = st.columns(3)
         with c1:
+            eur_default = round(get_currency_rate("EUR")["rate"], 4) if get_currency_rate("EUR") else CURRENCY_RATES.get("EUR", 100.0)
             eur_rate = st.number_input("Курс ЕВРО (₽)", min_value=0.01,
-                                       value=CURRENCY_RATES["EUR"], format="%.2f", key="eur_rate_input")
+                                       value=eur_default, format="%.4f", key="eur_rate_input")
         with c2:
+            usd_default = round(get_currency_rate("USD")["rate"], 4) if get_currency_rate("USD") else CURRENCY_RATES.get("USD", 92.5)
+            usd_rate = st.number_input("Курс USD (₽)", min_value=0.01,
+                                       value=usd_default, format="%.4f", key="usd_rate_input")
+        with c3:
             weight_input = st.number_input("Вес/количество (кг/шт)",
                                            min_value=0.0, value=0.0, format="%.2f", key="weight_input")
 
@@ -556,6 +638,7 @@ if show_classification:
                 country_code=selected_country_code,
                 weight=weight_input,
                 eur_rate=eur_rate,
+                usd_rate=usd_rate,
                 allow_unverified=manual_confirmed,
                 manual_duty_rate=manual_duty_rate,
                 manual_vat_rate=manual_vat_rate,
@@ -639,13 +722,23 @@ if st.session_state.calculation_done and st.session_state.last_calculation:
             st.markdown(f"{icon} {text}")
         st.markdown("---")
         st.markdown("**Источники расчётных данных:**")
-        st.markdown(
-            "- Код ТН ВЭД и ставка пошлины → таблица `hs_codes`\n"
-            "- Коэффициент преференции → таблица `preferences`\n"
-            "- Таможенный сбор → таблица `customs_fees` (ПП РФ № 1637 ред. № 1638)\n"
-            "- Расчёт платежей → продукционные правила R1–R18\n"
-            "- Таможенная стоимость → метод 1, по стоимости сделки (ТК ЕАЭС, ст. 39)"
-        )
+        if REF_DB_AVAILABLE:
+            st.markdown(
+                "- Код ТН ВЭД → `TNVEDHead` (CustomsReference.DB, 55 459 кодов)\n"
+                "- Ставка пошлины → `EntranceDuty` (262 117 записей)\n"
+                "- Ставка НДС → `VAT` (55 954 записей)\n"
+                "- Курсы валют ЦБ РФ → `CurrencyRates` (UserData.DB)\n"
+                "- Таможенный сбор → таблица `customs_fees` (ПП РФ № 1637 ред. № 1638)\n"
+                "- Расчёт платежей → продукционные правила R1–R18\n"
+                "- Таможенная стоимость → метод 1, по стоимости сделки (ТК ЕАЭС, ст. 39)"
+            )
+        else:
+            st.markdown(
+                "- Код ТН ВЭД и ставка пошлины → таблица `hs_codes` (локальная)\n"
+                "- Таможенный сбор → таблица `customs_fees` (ПП РФ № 1637 ред. № 1638)\n"
+                "- Расчёт платежей → продукционные правила R1–R18\n"
+                "- Таможенная стоимость → метод 1, по стоимости сделки (ТК ЕАЭС, ст. 39)"
+            )
 
     # БЛОК 5: Экспертное заключение
     st.subheader("📝 5. Экспертное заключение")

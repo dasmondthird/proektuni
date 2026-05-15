@@ -1,70 +1,566 @@
-# verifier.py — Проверка кодов ТН ВЭД по SQLite, скоринг признаков, получение ставок
+# verifier.py — Проверка кодов ТН ВЭД по профессиональному справочнику CustomsReference.DB
+#
+# Работает с двумя внешними БД (466 МБ + 18 МБ) и локальной БД для таможенных сборов.
 
 import sqlite3
+import re
 from typing import Optional, Dict, List, Tuple
+from datetime import date
 
-from config import DB_PATH
+from config import DB_PATH, CUSTOMS_REF_DB, USER_DATA_DB, REF_DB_AVAILABLE, USER_DB_AVAILABLE
 
 
-def get_db_connection() -> sqlite3.Connection:
-    """Создаёт подключение к SQLite с поддержкой словарей."""
+_EAEU_MEMBERS = {"KZ", "BY", "AM", "KG"}
+
+_DEVELOPING_COUNTRIES = {
+    "IN", "VN", "RS", "EG", "BD", "ET", "TZ", "KE", "GH", "SN",
+    "MZ", "KH", "MM", "LA", "NP", "LK", "PK", "ID", "PH", "TH",
+    "MY", "BR", "AR", "CL", "CO", "PE", "EC", "UY", "PY", "MX",
+    "CR", "PA", "DO", "CU", "JM", "NG", "CM", "CI", "DZ", "MA",
+    "TN", "JO", "LB", "IR", "IQ", "SY",
+}
+
+_LEAST_DEVELOPED = {
+    "BD", "ET", "TZ", "MZ", "SN", "KH", "MM", "LA", "NP",
+    "AF", "BF", "BI", "TD", "CD", "ER", "GN", "GW", "HT",
+    "KI", "LS", "LR", "MG", "MW", "ML", "MR", "NE", "RW",
+    "ST", "SL", "SO", "SS", "SD", "TL", "TG", "TV", "UG",
+    "VU", "YE", "ZM",
+}
+
+
+def _smart_text(data):
+    if isinstance(data, bytes):
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data.decode("cp1251", errors="replace")
+    return str(data) if data is not None else ""
+
+
+def _ref_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(CUSTOMS_REF_DB)
+    conn.text_factory = _smart_text
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _user_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(USER_DATA_DB)
+    conn.text_factory = _smart_text
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _local_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def verify_code(code: str) -> Optional[Dict]:
-    """
-    Проверяет наличие кода ТН ВЭД в справочнике и возвращает данные по нему.
+def _today() -> str:
+    return date.today().isoformat()
 
-    :param code: 10-значный код ТН ВЭД
-    :return: словарь с данными кода или None, если не найден
-    """
-    conn = get_db_connection()
+
+# ═══════════════════════════════════════════════════════════════
+# 1. Верификация кода ТН ВЭД (TNVEDHead)
+# ═══════════════════════════════════════════════════════════════
+
+def verify_code(code: str) -> Optional[Dict]:
+    code = code.strip()
+    if not code or not REF_DB_AVAILABLE:
+        return None
+
+    conn = _ref_conn()
     try:
         cursor = conn.execute(
-            "SELECT code, group_number, description, duty_type, duty_rate, vat_rate, "
-            "       excise, keywords, function_features, material_features, "
-            "       application_area, updated_at "
-            "FROM hs_codes WHERE code = ?",
-            (code.strip(),)
+            "SELECT _id, Code, AddCode, Name, LongName, MeasureUnitQualifierCode "
+            "FROM TNVEDHead WHERE Code = ? LIMIT 1",
+            (code,),
         )
         row = cursor.fetchone()
-        if row:
-            return {
-                "code": row["code"],
-                "group_number": row["group_number"],
-                "description": row["description"],
-                "duty_type": row["duty_type"],
-                "duty_rate": row["duty_rate"],
-                "vat_rate": row["vat_rate"],
-                "excise": row["excise"],
-                "keywords": row["keywords"],
-                "function_features": row["function_features"],
-                "material_features": row["material_features"],
-                "application_area": row["application_area"],
-                "updated_at": row["updated_at"],
-                "verified": True,
-            }
-        return None
+        if not row:
+            return None
+
+        duty = _get_base_duty(conn, code)
+        vat = _get_vat_rate(conn, code)
+        excise = _get_excise_rate(conn, code)
+
+        duty_type = "адвалорная"
+        duty_rate = 0.0
+        if duty:
+            duty_rate = duty["rate"] or 0.0
+            sign = duty["rate_sign"]
+            if sign == "%":
+                duty_type = "адвалорная"
+            elif sign in ("978", "840"):
+                duty_type = "специфическая"
+            if duty.get("alt_rate") is not None:
+                duty_type = "комбинированная"
+
+        try:
+            group_number = int(code[:2])
+        except ValueError:
+            group_number = 0
+
+        description = row["Name"] or row["LongName"] or ""
+
+        return {
+            "code": code,
+            "group_number": group_number,
+            "description": description,
+            "long_description": row["LongName"] or description,
+            "duty_type": duty_type,
+            "duty_rate": duty_rate,
+            "vat_rate": vat if vat is not None else 22.0,
+            "excise": excise or 0,
+            "measure_unit": row["MeasureUnitQualifierCode"] or "",
+            "keywords": "",
+            "function_features": "",
+            "material_features": "",
+            "application_area": "",
+            "updated_at": _today(),
+            "verified": True,
+            "source": "CustomsReference.DB",
+        }
     finally:
         conn.close()
 
 
+# ═══════════════════════════════════════════════════════════════
+# 2. Ставки ввозной пошлины (EntranceDuty)
+# ═══════════════════════════════════════════════════════════════
+
+def _get_base_duty(conn, code: str, ref_date: str = None) -> Optional[Dict]:
+    if ref_date is None:
+        ref_date = _today()
+    cursor = conn.execute(
+        "SELECT Rate, RateSign, MeasureUnitCode, "
+        "       AddRate, AddRateSign, AddMeasureUnitCode, "
+        "       AltRate, AltRateSign, AltMeasureUnitCode "
+        "FROM EntranceDuty "
+        "WHERE BeginCode <= ? AND EndCode >= ? "
+        "  AND Rate IS NOT NULL "
+        "  AND (ApplyCountries IS NULL OR ApplyCountries = '') "
+        "  AND (Preference IS NULL OR Preference = '') "
+        "  AND BeginDate <= ? "
+        "  AND (EndDate IS NULL OR EndDate = '' OR EndDate >= ?) "
+        "ORDER BY BeginDate DESC LIMIT 1",
+        (code, code, ref_date, ref_date),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "rate": row["Rate"],
+        "rate_sign": row["RateSign"],
+        "rate_unit": row["MeasureUnitCode"],
+        "add_rate": row["AddRate"],
+        "add_rate_sign": row["AddRateSign"],
+        "add_rate_unit": row["AddMeasureUnitCode"],
+        "alt_rate": row["AltRate"],
+        "alt_rate_sign": row["AltRateSign"],
+        "alt_rate_unit": row["AltMeasureUnitCode"],
+    }
+
+
+def get_duty_info(code: str) -> Optional[Dict]:
+    if not REF_DB_AVAILABLE:
+        return None
+
+    conn = _ref_conn()
+    try:
+        duty = _get_base_duty(conn, code)
+        vat = _get_vat_rate(conn, code)
+        excise = _get_excise_rate(conn, code)
+
+        if duty is None:
+            return None
+
+        rate = duty["rate"] or 0.0
+        sign = duty["rate_sign"]
+
+        if sign == "%":
+            duty_type = "адвалорная"
+        elif sign in ("978", "840"):
+            duty_type = "специфическая"
+        else:
+            duty_type = "адвалорная"
+
+        if duty.get("alt_rate") is not None:
+            duty_type = "комбинированная"
+
+        return {
+            "duty_type": duty_type,
+            "duty_rate": rate,
+            "rate_sign": sign,
+            "rate_unit": duty["rate_unit"],
+            "add_rate": duty["add_rate"],
+            "add_rate_sign": duty["add_rate_sign"],
+            "add_rate_unit": duty["add_rate_unit"],
+            "alt_rate": duty["alt_rate"],
+            "alt_rate_sign": duty["alt_rate_sign"],
+            "alt_rate_unit": duty["alt_rate_unit"],
+            "vat_rate": vat if vat is not None else 22.0,
+            "excise": excise or 0,
+            "source": "CustomsReference.DB (верифицировано)",
+        }
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 3. НДС (VAT)
+# ═══════════════════════════════════════════════════════════════
+
+def _get_vat_rate(conn, code: str, ref_date: str = None) -> Optional[float]:
+    if ref_date is None:
+        ref_date = _today()
+    cursor = conn.execute(
+        "SELECT Rate FROM VAT "
+        "WHERE BeginCode <= ? AND EndCode >= ? "
+        "  AND Rate IS NOT NULL "
+        "  AND (Preference IS NULL OR Preference = '') "
+        "  AND BeginDate <= ? "
+        "  AND (EndDate IS NULL OR EndDate = '' OR EndDate >= ?) "
+        "ORDER BY BeginDate DESC LIMIT 1",
+        (code, code, ref_date, ref_date),
+    )
+    row = cursor.fetchone()
+    return row["Rate"] if row else None
+
+
+# ═══════════════════════════════════════════════════════════════
+# 4. Акцизы (Excise)
+# ═══════════════════════════════════════════════════════════════
+
+def _get_excise_rate(conn, code: str, ref_date: str = None) -> Optional[float]:
+    if ref_date is None:
+        ref_date = _today()
+    cursor = conn.execute(
+        "SELECT Rate, RateSign, MeasureUnitCode FROM Excise "
+        "WHERE BeginCode <= ? AND EndCode >= ? "
+        "  AND Rate IS NOT NULL "
+        "  AND BeginDate <= ? "
+        "  AND (EndDate IS NULL OR EndDate = '' OR EndDate >= ?) "
+        "ORDER BY BeginDate DESC LIMIT 1",
+        (code, code, ref_date, ref_date),
+    )
+    row = cursor.fetchone()
+    return row["Rate"] if row else None
+
+
+# ═══════════════════════════════════════════════════════════════
+# 5. Страны (WorldCountries) и преференции
+# ═══════════════════════════════════════════════════════════════
+
+def get_country_info(alpha_code: str) -> Optional[Dict]:
+    if not REF_DB_AVAILABLE:
+        return None
+    conn = _ref_conn()
+    try:
+        cursor = conn.execute(
+            "SELECT _id, Code, AlphaCode, AlphaCode3, ShortName, Name, "
+            "       DutySign, Unfriendly "
+            "FROM WorldCountries "
+            "WHERE (AlphaCode = ? OR AlphaCode3 = ?) "
+            "  AND (EndDate IS NULL OR EndDate = '' OR EndDate >= ?) "
+            "ORDER BY BeginDate DESC LIMIT 1",
+            (alpha_code.upper(), alpha_code.upper(), _today()),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "code": row["Code"],
+            "alpha2": row["AlphaCode"],
+            "alpha3": row["AlphaCode3"],
+            "short_name": row["ShortName"],
+            "full_name": row["Name"],
+            "duty_sign": row["DutySign"],
+            "unfriendly": row["Unfriendly"],
+        }
+    finally:
+        conn.close()
+
+
+def get_all_countries() -> List[Tuple[str, str, float]]:
+    if not REF_DB_AVAILABLE:
+        return []
+    conn = _ref_conn()
+    try:
+        cursor = conn.execute(
+            "SELECT AlphaCode, ShortName FROM WorldCountries "
+            "WHERE AlphaCode IS NOT NULL AND AlphaCode != '' "
+            "  AND (EndDate IS NULL OR EndDate = '' OR EndDate >= ?) "
+            "GROUP BY AlphaCode "
+            "ORDER BY ShortName",
+            (_today(),),
+        )
+        result = []
+        seen = set()
+        for row in cursor.fetchall():
+            ac = row["AlphaCode"]
+            if ac in seen:
+                continue
+            seen.add(ac)
+            coeff = _preference_coefficient_for(ac)
+            result.append((ac, row["ShortName"], coeff))
+        return result
+    finally:
+        conn.close()
+
+
+def _preference_coefficient_for(alpha2: str) -> float:
+    alpha2 = alpha2.upper()
+    if alpha2 in _EAEU_MEMBERS:
+        return 0.0
+    if alpha2 in _LEAST_DEVELOPED:
+        return 0.0
+    if alpha2 in _DEVELOPING_COUNTRIES:
+        return 0.75
+    return 1.0
+
+
+def _preference_type_for(alpha2: str) -> str:
+    alpha2 = alpha2.upper()
+    if alpha2 in _EAEU_MEMBERS:
+        return "нулевая ставка (ЕАЭС)"
+    if alpha2 in _LEAST_DEVELOPED:
+        return "нулевая ставка (наименее развитая)"
+    if alpha2 in _DEVELOPING_COUNTRIES:
+        return "преференциальная (развивающаяся)"
+    return "базовая"
+
+
+def get_preference_coefficient(country_code: str) -> float:
+    return _preference_coefficient_for(country_code)
+
+
+def get_preference_info(country_code: str) -> Optional[Dict]:
+    cc = country_code.upper()
+    info = get_country_info(cc)
+    name = info["short_name"] if info else cc
+    return {
+        "country_code": cc,
+        "country_name": name,
+        "preference_type": _preference_type_for(cc),
+        "coefficient": _preference_coefficient_for(cc),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# 6. Курсы валют (UserData.DB → CurrencyRates)
+# ═══════════════════════════════════════════════════════════════
+
+def get_currency_rate(alpha_code: str, ref_date: str = None) -> Optional[Dict]:
+    if not USER_DB_AVAILABLE:
+        return None
+    if ref_date is None:
+        ref_date = _today()
+    conn = _user_conn()
+    try:
+        cursor = conn.execute(
+            "SELECT Rate, Amount, BeginDate FROM CurrencyRates "
+            "WHERE AlphaCode = ? AND BeginDate <= ? "
+            "ORDER BY BeginDate DESC LIMIT 1",
+            (alpha_code.upper(), ref_date),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        amount = row["Amount"] or 1
+        return {
+            "rate": row["Rate"] / amount if amount != 1 else row["Rate"],
+            "raw_rate": row["Rate"],
+            "amount": amount,
+            "date": row["BeginDate"],
+            "alpha_code": alpha_code.upper(),
+        }
+    finally:
+        conn.close()
+
+
+def get_latest_rates() -> Dict[str, float]:
+    result = {}
+    for code in ("USD", "EUR", "CNY", "GBP", "JPY", "KRW", "TRY"):
+        info = get_currency_rate(code)
+        if info:
+            result[code] = round(info["rate"], 4)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# 7. Обновление курсов ЦБ РФ
+# ═══════════════════════════════════════════════════════════════
+
+def update_currency_rates_from_cbr(target_date: date = None) -> bool:
+    if not USER_DB_AVAILABLE:
+        return False
+    import requests
+    from xml.etree import ElementTree
+
+    if target_date is None:
+        target_date = date.today()
+    url = f"https://www.cbr.ru/scripts/XML_daily.asp?date_req={target_date:%d/%m/%Y}"
+
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.encoding = "windows-1251"
+        root = ElementTree.fromstring(resp.text.encode("utf-8"))
+    except Exception:
+        return False
+
+    conn = sqlite3.connect(USER_DATA_DB)
+    try:
+        cursor = conn.cursor()
+        date_str = target_date.isoformat()
+        inserted = 0
+        for valute in root.findall("Valute"):
+            num_code = valute.findtext("NumCode", "").strip()
+            char_code = valute.findtext("CharCode", "").strip()
+            nominal = int(valute.findtext("Nominal", "1").strip())
+            value_str = valute.findtext("Value", "0").strip().replace(",", ".")
+            rate = float(value_str)
+
+            existing = cursor.execute(
+                "SELECT _id FROM CurrencyRates WHERE AlphaCode = ? AND BeginDate = ?",
+                (char_code, date_str),
+            ).fetchone()
+            if existing:
+                continue
+
+            cursor.execute(
+                "INSERT INTO CurrencyRates (Code, AlphaCode, Amount, Rate, BeginDate) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (num_code, char_code, nominal, rate, date_str),
+            )
+            inserted += 1
+        conn.commit()
+        return inserted > 0
+    except Exception:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 8. Поиск кодов по описанию (AlphabeticalIndex + TNVEDHead)
+# ═══════════════════════════════════════════════════════════════
+
+_STOP_WORDS = {
+    # Предлоги, союзы, частицы, местоимения (бесполезны для поиска товара)
+    "для", "или", "при", "что", "как", "это", "его", "они", "все", "них",
+    "она", "оно", "они", "наш", "ваш", "так", "уже", "еще", "ещё", "тот",
+    "эта", "эти", "кто", "где", "чем", "чей", "нас", "вас", "без", "под",
+    "над", "про", "через", "между", "после", "перед", "около", "кроме",
+    "the", "and", "for", "with", "from", "this", "that", "not", "are",
+    "прочие", "части", "другие", "другое", "прочее", "том", "числе",
+    "включая", "также", "более", "менее", "ином", "месте",
+}
+
+
+def find_codes_by_description(description: str, top_n: int = 5) -> List[Dict]:
+    if not REF_DB_AVAILABLE:
+        return []
+
+    desc_lower = description.lower().strip()
+    if not desc_lower:
+        return []
+
+    # Извлечение значимых слов (мин. 3 буквы), убираем стоп-слова
+    all_words = re.findall(r"[а-яёa-z0-9]{3,}", desc_lower)
+    words = [w for w in all_words if w not in _STOP_WORDS]
+    if not words:
+        # Если после фильтрации ничего — вернуть оригинальные
+        words = all_words
+    if not words:
+        return []
+
+    conn = _ref_conn()
+    try:
+        results = []
+        seen_codes = set()
+
+        # ── Этап 1: AlphabeticalIndex (SearchName = UPPERCASE) ──
+        for word in words[:5]:
+            pattern = f"%{word.upper()}%"
+            cursor = conn.execute(
+                "SELECT Code, Name, SearchName FROM AlphabeticalIndex "
+                "WHERE SearchName LIKE ? LIMIT 50",
+                (pattern,),
+            )
+            for row in cursor.fetchall():
+                code = row["Code"]
+                if code in seen_codes or not code:
+                    continue
+                seen_codes.add(code)
+
+                search_name = (row["SearchName"] or "").upper()
+                name = row["Name"] or ""
+                matched = [w for w in words if w.upper() in search_name]
+                # Скоринг: каждое совпадение = 1 балл + бонус за длину слова
+                score = sum(1 + len(w) / 10 for w in matched)
+                if score > 0:
+                    results.append({
+                        "code": code,
+                        "name": name,
+                        "reasoning": f"Совпадение по алфавитному указателю: {', '.join(matched)}",
+                        "score": score,
+                        "source": "db",
+                    })
+
+        # ── Этап 2: TNVEDHead — Name/LongName (mixed case) ──
+        for word in words[:5]:
+            # SQLite LIKE — case-insensitive только для ASCII,
+            # поэтому ищем и lowercase и uppercase для кириллицы
+            lower_pat = f"%{word}%"
+            upper_pat = f"%{word.upper()}%"
+            title_pat = f"%{word.capitalize()}%"
+            cursor = conn.execute(
+                "SELECT Code, Name, LongName FROM TNVEDHead "
+                "WHERE (Name LIKE ? OR Name LIKE ? OR Name LIKE ? "
+                "       OR LongName LIKE ? OR LongName LIKE ? OR LongName LIKE ?) "
+                "  AND (HasChild IS NULL OR HasChild = 0) "
+                "LIMIT 30",
+                (lower_pat, upper_pat, title_pat,
+                 lower_pat, upper_pat, title_pat),
+            )
+            for row in cursor.fetchall():
+                code = row["Code"]
+                if code in seen_codes or not code or len(code) < 4:
+                    continue
+                seen_codes.add(code)
+
+                name = row["Name"] or ""
+                long_name = row["LongName"] or ""
+                full_text = (name + " " + long_name).lower()
+                matched = [w for w in words if w in full_text]
+                score = sum(1 + len(w) / 10 for w in matched)
+                # Бонус за 10-значный код (конечная позиция)
+                if len(code) == 10:
+                    score += 0.5
+                if score > 0:
+                    results.append({
+                        "code": code,
+                        "name": name,
+                        "reasoning": f"Совпадение по названию ТН ВЭД: {', '.join(matched)}",
+                        "score": score,
+                        "source": "db",
+                    })
+
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return results[:top_n]
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 9. Скоринг совпадения кода с описанием
+# ═══════════════════════════════════════════════════════════════
+
 def score_code_match(code: str, product_description: str) -> Dict:
-    """
-    Оценивает степень совпадения описания товара с признаками кода ТН ВЭД.
-
-    Скоринг без ML — простое правило «совпало ключевое слово → +1 балл»:
-      - совпало ключевое слово      → +1 за каждое
-      - совпало назначение (функция) → +3
-      - совпала область применения   → +2
-      - совпал материал              → +1
-
-    :param code: код ТН ВЭД
-    :param product_description: описание товара
-    :return: словарь {score, max_score, details, explanation}
-    """
     verified = verify_code(code)
     if not verified:
         return {
@@ -75,37 +571,30 @@ def score_code_match(code: str, product_description: str) -> Dict:
         }
 
     desc_lower = product_description.lower()
+    code_desc = (verified["description"] + " " + verified.get("long_description", "")).lower()
+
+    desc_words = set(re.findall(r"[а-яёa-z0-9]{3,}", desc_lower))
+    code_words = set(re.findall(r"[а-яёa-z0-9]{3,}", code_desc))
+
+    matched = desc_words & code_words
+    noise = {"для", "или", "при", "что", "как", "это", "его", "они", "все", "них",
+             "the", "and", "for", "with", "from", "прочие", "части", "другие",
+             "том", "числе", "включая", "кроме", "также", "более", "менее"}
+    matched -= noise
+
+    score = len(matched)
+    max_score = max(len(desc_words - noise), 1)
     details = []
-    score = 0
 
-    kw_list = [k.strip().lower() for k in verified["keywords"].split(",") if k.strip()]
-    matched_kw = [k for k in kw_list if k in desc_lower]
-    if matched_kw:
-        score += len(matched_kw)
-        details.append(f"Ключевые слова ({len(matched_kw)}×1 б.): {', '.join(matched_kw)}")
+    if matched:
+        details.append(f"Совпавшие термины ({score}): {', '.join(sorted(matched)[:10])}")
 
-    func_list = [f.strip().lower() for f in verified["function_features"].split(",") if f.strip()]
-    matched_func = [f for f in func_list if f in desc_lower]
-    if matched_func:
-        score += 3
-        details.append(f"Назначение (+3 б.): {', '.join(matched_func)}")
-
-    app_list = [a.strip().lower() for a in verified["application_area"].split(",") if a.strip()]
-    matched_app = [a for a in app_list if a in desc_lower]
-    if matched_app:
-        score += 2
-        details.append(f"Область применения (+2 б.): {', '.join(matched_app)}")
-
-    mat_list = [m.strip().lower() for m in verified["material_features"].split(",") if m.strip()]
-    matched_mat = [m for m in mat_list if m in desc_lower]
-    if matched_mat:
-        score += 1
-        details.append(f"Материал (+1 б.): {', '.join(matched_mat)}")
-
-    max_score = len(kw_list) + 3 + 2 + 1
+    group_match = code[:4] in code_desc or code[:2] in code_desc
+    if group_match:
+        details.append("Группа/позиция совпадает")
 
     if score == 0:
-        explanation = "Совпадений признаков не обнаружено"
+        explanation = "Совпадений терминов не обнаружено"
     elif score <= 2:
         explanation = f"Низкое совпадение ({score} б.) — рекомендуется дополнительная проверка"
     elif score <= 5:
@@ -121,182 +610,31 @@ def score_code_match(code: str, product_description: str) -> Dict:
     }
 
 
-def get_duty_info(code: str) -> Optional[Dict]:
-    """
-    Получает информацию о ставках пошлины и НДС для кода ТН ВЭД.
-    """
-    verified = verify_code(code)
-    if verified:
-        return {
-            "duty_type": verified["duty_type"],
-            "duty_rate": verified["duty_rate"],
-            "vat_rate": verified["vat_rate"],
-            "excise": verified["excise"],
-            "source": "БД (верифицировано)",
-        }
-    return None
-
-
-def get_preference_coefficient(country_code: str) -> float:
-    """
-    Получает коэффициент преференции для страны происхождения.
-    """
-    conn = get_db_connection()
-    try:
-        cursor = conn.execute(
-            "SELECT coefficient FROM preferences WHERE country_code = ?",
-            (country_code.upper(),)
-        )
-        row = cursor.fetchone()
-        return row["coefficient"] if row else 1.0
-    finally:
-        conn.close()
-
-
-def get_preference_info(country_code: str) -> Optional[Dict]:
-    """
-    Получает полную информацию о преференциальном режиме страны.
-    """
-    conn = get_db_connection()
-    try:
-        cursor = conn.execute(
-            "SELECT country_code, country_name, preference_type, coefficient "
-            "FROM preferences WHERE country_code = ?",
-            (country_code.upper(),)
-        )
-        row = cursor.fetchone()
-        if row:
-            return {
-                "country_code": row["country_code"],
-                "country_name": row["country_name"],
-                "preference_type": row["preference_type"],
-                "coefficient": row["coefficient"],
-            }
-        return None
-    finally:
-        conn.close()
-
-
-def get_all_countries() -> List[Tuple[str, str, float]]:
-    """
-    Возвращает список всех стран из таблицы преференций.
-    """
-    conn = get_db_connection()
-    try:
-        cursor = conn.execute(
-            "SELECT country_code, country_name, coefficient FROM preferences ORDER BY country_name"
-        )
-        return [(row["country_code"], row["country_name"], row["coefficient"]) for row in cursor.fetchall()]
-    finally:
-        conn.close()
-
+# ═══════════════════════════════════════════════════════════════
+# 10. Таможенный сбор (локальная БД, ПП РФ № 1637 ред. № 1638)
+# ═══════════════════════════════════════════════════════════════
 
 def get_customs_fee(customs_value: float) -> float:
-    """
-    Определяет размер таможенного сбора по шкале (ПП РФ № 1637 в ред. № 1638).
-    """
-    conn = get_db_connection()
+    conn = _local_conn()
     try:
         cursor = conn.execute(
             "SELECT fee FROM customs_fees WHERE min_value <= ? AND max_value >= ? "
             "ORDER BY min_value LIMIT 1",
-            (customs_value, customs_value)
+            (customs_value, customs_value),
         )
         row = cursor.fetchone()
-        if row:
-            return row["fee"]
-        return 73860.0
-    finally:
-        conn.close()
-
-
-def find_codes_by_description(description: str, top_n: int = 3) -> List[Dict]:
-    """
-    Ищет коды ТН ВЭД в локальной базе знаний по ключевым словам описания товара.
-    Один запрос к БД, дальше — скоринг в памяти.
-    Используется как резервный поиск при недоступности LLM или как дополнение к нему.
-    """
-    desc_lower = description.lower()
-    conn = get_db_connection()
-    try:
-        cursor = conn.execute(
-            "SELECT code, description, duty_type, duty_rate, vat_rate, "
-            "keywords, function_features, material_features, application_area "
-            "FROM hs_codes"
-        )
-        rows = cursor.fetchall()
-    finally:
-        conn.close()
-
-    results = []
-    for row in rows:
-        score = 0
-        details = []
-
-        kw_list = [k.strip().lower() for k in (row["keywords"] or "").split(",") if k.strip()]
-        matched_kw = [k for k in kw_list if k in desc_lower]
-        if matched_kw:
-            score += len(matched_kw)
-            details.append(f"Ключевые слова: {', '.join(matched_kw)}")
-
-        func_list = [f.strip().lower() for f in (row["function_features"] or "").split(",") if f.strip()]
-        if any(f in desc_lower for f in func_list):
-            score += 3
-            details.append("Совпало назначение")
-
-        app_list = [a.strip().lower() for a in (row["application_area"] or "").split(",") if a.strip()]
-        if any(a in desc_lower for a in app_list):
-            score += 2
-            details.append("Совпала область применения")
-
-        mat_list = [m.strip().lower() for m in (row["material_features"] or "").split(",") if m.strip()]
-        if any(m in desc_lower for m in mat_list):
-            score += 1
-            details.append("Совпал материал")
-
-        if score > 0:
-            results.append({
-                "code": row["code"],
-                "name": row["description"],
-                "reasoning": "Подобрано по локальной базе знаний. " + ", ".join(details) + ".",
-                "score": score,
-                "source": "db",
-            })
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:top_n]
-
-
-def get_knowledge_base_stats() -> Dict:
-    """
-    Возвращает статистику базы знаний: количество записей в каждой таблице
-    и число продукционных правил экспертной подсистемы.
-    """
-    conn = get_db_connection()
-    try:
-        hs = conn.execute("SELECT COUNT(*) FROM hs_codes").fetchone()[0]
-        pref = conn.execute("SELECT COUNT(*) FROM preferences").fetchone()[0]
-        fees = conn.execute("SELECT COUNT(*) FROM customs_fees").fetchone()[0]
-        return {
-            "hs_codes": hs,
-            "preferences": pref,
-            "customs_fees": fees,
-            "rules": 18,
-        }
+        return row["fee"] if row else 73860.0
     finally:
         conn.close()
 
 
 def get_customs_fee_range(customs_value: float) -> Optional[Dict]:
-    """
-    Возвращает диапазон и сумму таможенного сбора для логирования правил.
-    """
-    conn = get_db_connection()
+    conn = _local_conn()
     try:
         cursor = conn.execute(
             "SELECT min_value, max_value, fee FROM customs_fees "
             "WHERE min_value <= ? AND max_value >= ? ORDER BY min_value LIMIT 1",
-            (customs_value, customs_value)
+            (customs_value, customs_value),
         )
         row = cursor.fetchone()
         if row:
@@ -308,3 +646,44 @@ def get_customs_fee_range(customs_value: float) -> Optional[Dict]:
         return None
     finally:
         conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 11. Статистика
+# ═══════════════════════════════════════════════════════════════
+
+def get_knowledge_base_stats() -> Dict:
+    stats = {"hs_codes": 0, "preferences": 0, "customs_fees": 0, "rules": 18,
+             "entrance_duty": 0, "vat_records": 0, "excise_records": 0,
+             "countries": 0, "currency_rates": 0, "certificates": 0}
+
+    if REF_DB_AVAILABLE:
+        conn = _ref_conn()
+        try:
+            stats["hs_codes"] = conn.execute("SELECT COUNT(*) FROM TNVEDHead").fetchone()[0]
+            stats["entrance_duty"] = conn.execute("SELECT COUNT(*) FROM EntranceDuty").fetchone()[0]
+            stats["vat_records"] = conn.execute("SELECT COUNT(*) FROM VAT").fetchone()[0]
+            stats["excise_records"] = conn.execute("SELECT COUNT(*) FROM Excise").fetchone()[0]
+            stats["countries"] = conn.execute(
+                "SELECT COUNT(DISTINCT AlphaCode) FROM WorldCountries WHERE AlphaCode IS NOT NULL"
+            ).fetchone()[0]
+            stats["certificates"] = conn.execute("SELECT COUNT(*) FROM SafetyCertificate").fetchone()[0]
+        finally:
+            conn.close()
+
+    if USER_DB_AVAILABLE:
+        conn = _user_conn()
+        try:
+            stats["currency_rates"] = conn.execute("SELECT COUNT(*) FROM CurrencyRates").fetchone()[0]
+        finally:
+            conn.close()
+
+    try:
+        conn = _local_conn()
+        stats["customs_fees"] = conn.execute("SELECT COUNT(*) FROM customs_fees").fetchone()[0]
+        conn.close()
+    except Exception:
+        stats["customs_fees"] = 8
+
+    stats["preferences"] = stats["countries"]
+    return stats
