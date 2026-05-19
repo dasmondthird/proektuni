@@ -4,7 +4,7 @@
 import csv
 import io
 import os
-from datetime import datetime
+from datetime import datetime, date
 
 import streamlit as st
 
@@ -353,7 +353,12 @@ with col_rate:
         value=default_rate, format="%.4f", key=f"rate_{currency}",
     )
 with col_date:
-    declaration_date = st.date_input("Дата декларирования", key="decl_date")
+    declaration_date = st.date_input(
+        "Дата декларирования",
+        value=date(2026, 3, 24),
+        key="decl_date",
+    )
+ref_date = declaration_date.isoformat()
 
 all_filled = bool(
     (product_description or "").strip()
@@ -448,9 +453,9 @@ if show_classification:
         for i, (col, item) in enumerate(zip(cols, results[:3])):
             with col:
                 code = item["code"]
-                verified = verify_code(code)
+                verified = verify_code(code, ref_date=ref_date)
                 src = item.get("source", "llm")
-                score_info = score_code_match(code, product_description or "")
+                score_info = score_code_match(code, product_description or "", ref_date=ref_date)
 
                 src_badge = {
                     "db":   "🗄️ База знаний",
@@ -459,9 +464,15 @@ if show_classification:
                 }.get(src, "")
 
                 if verified:
-                    st.success(f"**{code}**\n\n{src_badge}")
+                    duty_info = get_duty_info(code, ref_date=ref_date)
+                    if duty_info:
+                        st.success(f"**{code}**\n\n{src_badge} ✅ ставки доступны")
+                    else:
+                        st.warning(
+                            f"**{code}**\n\n{src_badge} ⚠️ код найден в ТН ВЭД, "
+                            f"но ставка на {ref_date} не найдена"
+                        )
                     st.write(verified["description"])
-                    duty_info = get_duty_info(code)
                     if duty_info:
                         _sign = duty_info.get("rate_sign", "%")
                         if _sign == "%":
@@ -496,7 +507,7 @@ if show_classification:
         radio_options = []
         for item in results:
             code = item["code"]
-            verified = verify_code(code)
+            verified = verify_code(code, ref_date=ref_date)
             mark = "✅" if verified else "⚠️"
             name = (verified["description"] if verified else item["name"])[:60]
             src = item.get("source", "llm")
@@ -520,15 +531,24 @@ if show_classification:
     else:
         chosen_code = selected_option.split(" ")[0].strip()
 
-    chosen_verified = verify_code(chosen_code) if chosen_code else None
+    chosen_verified = verify_code(chosen_code, ref_date=ref_date) if chosen_code else None
+    chosen_duty_info = get_duty_info(chosen_code, ref_date=ref_date) if chosen_code else None
     is_unverified = bool(chosen_code) and chosen_verified is None
 
     if chosen_code:
         if chosen_verified:
-            st.success(
-                f"✅ Код **{chosen_code}** найден в справочнике: {chosen_verified['description']}"
-            )
-            sc = score_code_match(chosen_code, product_description or "")
+            if chosen_duty_info:
+                st.success(
+                    f"✅ Код **{chosen_code}** найден, ставки доступны на {ref_date} — расчёт возможен. "
+                    f"{chosen_verified['description']}"
+                )
+            else:
+                st.warning(
+                    f"⚠️ Код **{chosen_code}** найден в ТН ВЭД, но ставка на {ref_date} не найдена. "
+                    f"Расчёт по справочнику невозможен — попробуйте другую дату декларирования "
+                    f"или подтвердите ставку вручную."
+                )
+            sc = score_code_match(chosen_code, product_description or "", ref_date=ref_date)
             if sc["score"] > 0:
                 st.info(f"📊 Скоринг: {sc['explanation']}")
 
@@ -573,9 +593,11 @@ if show_classification:
     manual_duty_rate = 0.0
     manual_vat_rate = 22.0
 
-    if is_unverified:
+    needs_manual_rates = bool(chosen_code) and chosen_duty_info is None
+
+    if needs_manual_rates:
         manual_confirmed = st.checkbox(
-            "Я проверил код самостоятельно и подтверждаю его корректность",
+            "Я проверил код/ставку самостоятельно и подтверждаю корректность",
             key="manual_confirm",
         )
         if manual_confirmed:
@@ -611,7 +633,7 @@ if show_classification:
 
     # ── Кнопка расчёта
     code_ok = bool(chosen_code) and len(chosen_code) >= 4
-    verification_ok = (chosen_verified is not None) or manual_confirmed
+    verification_ok = (chosen_duty_info is not None) or manual_confirmed
 
     calc_btn = st.button(
         "💰 Рассчитать платежи",
@@ -626,7 +648,7 @@ if show_classification:
             if item.get("code") == chosen_code:
                 chosen_reasoning = item.get("llm_reasoning") or item.get("reasoning", "")
                 break
-        chosen_score = score_code_match(chosen_code, product_description or "") if chosen_verified else None
+        chosen_score = score_code_match(chosen_code, product_description or "", ref_date=ref_date) if chosen_verified else None
 
         try:
             result = calculate_all_payments(
@@ -642,6 +664,7 @@ if show_classification:
                 allow_unverified=manual_confirmed,
                 manual_duty_rate=manual_duty_rate,
                 manual_vat_rate=manual_vat_rate,
+                ref_date=ref_date,
             )
             st.session_state.last_calculation = result
             st.session_state.last_code = chosen_code
@@ -703,7 +726,7 @@ if st.session_state.calculation_done and st.session_state.last_calculation:
     for rule in applied:
         st.markdown(f"- **{rule['id']}** — {rule['name']}: {rule['explanation']}")
 
-    code_in_db_flag = bool(verify_code(st.session_state.last_code))
+    code_in_db_flag = bool(verify_code(st.session_state.last_code, ref_date=ref_date))
 
     with st.expander("🛡️ Технический контроль результата"):
         checks = [
@@ -748,7 +771,7 @@ if st.session_state.calculation_done and st.session_state.last_calculation:
     except Exception:
         _country_name = selected_country_code
 
-    code_in_db = bool(verify_code(st.session_state.last_code))
+    code_in_db = bool(verify_code(st.session_state.last_code, ref_date=ref_date))
 
     # Краткое заключение — 4 строки на экране
     _code_status = ("подтверждён в локальной базе знаний" if code_in_db

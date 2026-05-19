@@ -50,16 +50,19 @@ GDRIVE_REF_DB_ID = "1VZDNn81GS1SKDf-voph0hKfp6U4I6O3n"
 
 # Порядок поиска баз данных:
 #   1) Переменная окружения CUSTOMS_DATA_DIR (если задана)
-#   2) Локальный путь ~/Desktop/apsps/CustomsData (для рабочего стола)
-#   3) /tmp/customs_data (для Streamlit Cloud — автоскачивание с Google Drive)
+#   2) Папка db/ внутри репозитория (локальная разработка)
+#   3) Локальный путь ~/Desktop/apsps/CustomsData (для рабочего стола)
+#   4) /tmp/customs_data (для Streamlit Cloud — автоскачивание с Google Drive)
+_REPO_DATA_DIR = os.path.join(BASE_DIR, "db")
 _LOCAL_DATA_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "apsps", "CustomsData")
 _CLOUD_DATA_DIR = os.path.join("/tmp", "customs_data")
 
 CUSTOMS_DATA_DIR = os.environ.get("CUSTOMS_DATA_DIR", "")
 
 if not CUSTOMS_DATA_DIR:
-    # Проверяем локальный путь
-    if os.path.exists(os.path.join(_LOCAL_DATA_DIR, "CustomsReference.DB")):
+    if os.path.exists(os.path.join(_REPO_DATA_DIR, "CustomsReference.DB")):
+        CUSTOMS_DATA_DIR = _REPO_DATA_DIR
+    elif os.path.exists(os.path.join(_LOCAL_DATA_DIR, "CustomsReference.DB")):
         CUSTOMS_DATA_DIR = _LOCAL_DATA_DIR
     else:
         # Облачный режим — скачаем в /tmp

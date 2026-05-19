@@ -62,12 +62,17 @@ def _today() -> str:
     return date.today().isoformat()
 
 
+def normalize_tnved_code(code: str) -> str:
+    """Нормализация кода ТН ВЭД: удаляем все нецифровые символы (пробелы, точки, дефисы)."""
+    return re.sub(r"\D", "", str(code or ""))
+
+
 # ═══════════════════════════════════════════════════════════════
 # 1. Верификация кода ТН ВЭД (TNVEDHead)
 # ═══════════════════════════════════════════════════════════════
 
-def verify_code(code: str) -> Optional[Dict]:
-    code = code.strip()
+def verify_code(code: str, ref_date: str = None) -> Optional[Dict]:
+    code = normalize_tnved_code(code)
     if not code or not REF_DB_AVAILABLE:
         return None
 
@@ -82,9 +87,9 @@ def verify_code(code: str) -> Optional[Dict]:
         if not row:
             return None
 
-        duty = _get_base_duty(conn, code)
-        vat = _get_vat_rate(conn, code)
-        excise = _get_excise_rate(conn, code)
+        duty = _get_base_duty(conn, code, ref_date)
+        vat = _get_vat_rate(conn, code, ref_date)
+        excise = _get_excise_rate(conn, code, ref_date)
 
         duty_type = "адвалорная"
         duty_rate = 0.0
@@ -164,15 +169,19 @@ def _get_base_duty(conn, code: str, ref_date: str = None) -> Optional[Dict]:
     }
 
 
-def get_duty_info(code: str) -> Optional[Dict]:
+def get_duty_info(code: str, ref_date: str = None) -> Optional[Dict]:
     if not REF_DB_AVAILABLE:
+        return None
+
+    code = normalize_tnved_code(code)
+    if not code:
         return None
 
     conn = _ref_conn()
     try:
-        duty = _get_base_duty(conn, code)
-        vat = _get_vat_rate(conn, code)
-        excise = _get_excise_rate(conn, code)
+        duty = _get_base_duty(conn, code, ref_date)
+        vat = _get_vat_rate(conn, code, ref_date)
+        excise = _get_excise_rate(conn, code, ref_date)
 
         if duty is None:
             return None
@@ -560,8 +569,8 @@ def find_codes_by_description(description: str, top_n: int = 5) -> List[Dict]:
 # 9. Скоринг совпадения кода с описанием
 # ═══════════════════════════════════════════════════════════════
 
-def score_code_match(code: str, product_description: str) -> Dict:
-    verified = verify_code(code)
+def score_code_match(code: str, product_description: str, ref_date: str = None) -> Dict:
+    verified = verify_code(code, ref_date=ref_date)
     if not verified:
         return {
             "score": 0,

@@ -7,6 +7,10 @@ __pycache__/
 .Python
 *.sqlite3
 *.db
+*.DB
+# Большой справочник не пушим — качается с Google Drive (config.py: GDRIVE_REF_DB_ID)
+db/CustomsReference.DB
+db/UserData.DB
 .DS_Store
 .idea/
 .vscode/

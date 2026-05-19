@@ -61,6 +61,7 @@ def calculate_all_payments(
     allow_unverified: bool = False,
     manual_duty_rate: float = 0.0,
     manual_vat_rate: float = 0.0,
+    ref_date: str = None,
 ) -> Dict:
     rules: List[Dict] = []
 
@@ -73,7 +74,7 @@ def calculate_all_payments(
     )
 
     # ── Получение ставок из базы знаний ──
-    duty_info = get_duty_info(hs_code)
+    duty_info = get_duty_info(hs_code, ref_date=ref_date)
     is_manual = False
     if duty_info is None:
         if not allow_unverified:
