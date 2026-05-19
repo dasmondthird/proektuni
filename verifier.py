@@ -139,6 +139,8 @@ def verify_code(code: str, ref_date: str = None) -> Optional[Dict]:
 def _get_base_duty(conn, code: str, ref_date: str = None) -> Optional[Dict]:
     if ref_date is None:
         ref_date = _today()
+
+    # Шаг 1: строгий поиск (базовая ставка, без преференций и кодов стран)
     cursor = conn.execute(
         "SELECT Rate, RateSign, MeasureUnitCode, "
         "       AddRate, AddRateSign, AddMeasureUnitCode, "
@@ -154,6 +156,23 @@ def _get_base_duty(conn, code: str, ref_date: str = None) -> Optional[Dict]:
         (code, code, ref_date, ref_date),
     )
     row = cursor.fetchone()
+
+    # Шаг 2: расширенный поиск — без ApplyCountries/Preference фильтров
+    if not row:
+        cursor = conn.execute(
+            "SELECT Rate, RateSign, MeasureUnitCode, "
+            "       AddRate, AddRateSign, AddMeasureUnitCode, "
+            "       AltRate, AltRateSign, AltMeasureUnitCode "
+            "FROM EntranceDuty "
+            "WHERE BeginCode <= ? AND EndCode >= ? "
+            "  AND Rate IS NOT NULL "
+            "  AND BeginDate <= ? "
+            "  AND (EndDate IS NULL OR EndDate = '' OR EndDate >= ?) "
+            "ORDER BY BeginDate DESC LIMIT 1",
+            (code, code, ref_date, ref_date),
+        )
+        row = cursor.fetchone()
+
     if not row:
         return None
     return {
@@ -230,6 +249,19 @@ def _get_vat_rate(conn, code: str, ref_date: str = None) -> Optional[float]:
         "WHERE BeginCode <= ? AND EndCode >= ? "
         "  AND Rate IS NOT NULL "
         "  AND (Preference IS NULL OR Preference = '') "
+        "  AND BeginDate <= ? "
+        "  AND (EndDate IS NULL OR EndDate = '' OR EndDate >= ?) "
+        "ORDER BY BeginDate DESC LIMIT 1",
+        (code, code, ref_date, ref_date),
+    )
+    row = cursor.fetchone()
+    if row:
+        return row["Rate"]
+    # Расширенный поиск без Preference
+    cursor = conn.execute(
+        "SELECT Rate FROM VAT "
+        "WHERE BeginCode <= ? AND EndCode >= ? "
+        "  AND Rate IS NOT NULL "
         "  AND BeginDate <= ? "
         "  AND (EndDate IS NULL OR EndDate = '' OR EndDate >= ?) "
         "ORDER BY BeginDate DESC LIMIT 1",
@@ -470,9 +502,12 @@ _STOP_WORDS = {
 }
 
 
-def find_codes_by_description(description: str, top_n: int = 5) -> List[Dict]:
+def find_codes_by_description(description: str, top_n: int = 5,
+                              ref_date: str = None) -> List[Dict]:
     if not REF_DB_AVAILABLE:
         return []
+    if ref_date is None:
+        ref_date = _today()
 
     desc_lower = description.lower().strip()
     if not desc_lower:
@@ -559,7 +594,18 @@ def find_codes_by_description(description: str, top_n: int = 5) -> List[Dict]:
                         "source": "db",
                     })
 
-        results.sort(key=lambda x: x["score"], reverse=True)
+        # Помечаем доступность расчёта (есть ли ставка на ref_date)
+        # и слабые совпадения (score < 1.5).
+        for r in results:
+            r["calculation_available"] = _get_base_duty(conn, r["code"], ref_date) is not None
+            r["weak_match"] = r["score"] < 1.5
+
+        # Сортируем сначала по релевантности описанию, потом по доступности расчёта.
+        # Ставка — НЕ доказательство, что код подходит, поэтому score первичен.
+        results.sort(
+            key=lambda x: (x["score"], x.get("calculation_available", False)),
+            reverse=True,
+        )
         return results[:top_n]
     finally:
         conn.close()
